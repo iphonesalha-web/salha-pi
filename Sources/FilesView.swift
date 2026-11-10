@@ -103,7 +103,8 @@ struct FilesView: View {
     }
 
     private var visible: [RemoteFile] {
-        showHidden ? files : files.filter { !$0.name.hasPrefix(".") }
+        // lost+found مجلد نظام فارغ دائماً في أقراص ext4 — لا فائدة من إظهاره
+        showHidden ? files : files.filter { !$0.name.hasPrefix(".") && $0.name != "lost+found" }
     }
 
     @ViewBuilder

@@ -152,6 +152,12 @@ final class Pi: ObservableObject {
             || s.localizedCaseInsensitiveContains("nodename") {
             return "لم يُعثر على العنوان. جرّب العنوان الرقمي (192.168.178.x) في إعدادات الجهاز."
         }
+        if s.contains("PERMISSION_DENIED") || s.localizedCaseInsensitiveContains("permission denied") {
+            return "لا تملك صلاحية لهذا المجلد أو الملف — هو خاص بالنظام (root)."
+        }
+        if s.contains("NO_SUCH_FILE") {
+            return "الملف أو المجلد غير موجود."
+        }
         if let e = error as? CommandError { return e.message }
         return "تعذّر الاتصال: " + s
     }
