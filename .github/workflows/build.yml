@@ -1,0 +1,72 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ipa
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_16*.app | sort -V | tail -1)"
+          xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate project
+        run: xcodegen generate
+
+      - name: Build (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild -project SalhaPi.xcodeproj -scheme SalhaPi \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            -skipPackagePluginValidation -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee build.log | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
+          if [ ! -d build/Build/Products/Release-iphoneos/SalhaPi.app ]; then
+            # الأخطاء كملاحظات في صفحة البناء
+            grep -E "error:" build.log | sed 's|.*/Sources/|Sources/|' | sort -u | head -40 | while IFS= read -r l; do
+              echo "::error::${l:0:900}"
+            done
+            exit 1
+          fi
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/SalhaPi.app Payload/
+          APP=Payload/SalhaPi.app
+          mkdir -p "$APP/Frameworks"
+          for fw in build/Build/Products/Release-iphoneos/PackageFrameworks/*.framework build/Build/Products/Release-iphoneos/*.framework; do
+            [ -d "$fw" ] || continue
+            name=$(basename "$fw")
+            [ -d "$APP/Frameworks/$name" ] || cp -R "$fw" "$APP/Frameworks/"
+          done
+          rmdir "$APP/Frameworks" 2>/dev/null || true
+          zip -qry SalhaPi.ipa Payload
+          ls -lh SalhaPi.ipa
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v1.0.${{ github.run_number }}" SalhaPi.ipa \
+            --title "صالحة Pi v1.0.${{ github.run_number }}" \
+            --notes "ملف IPA غير موقّع — وقّعه بشهادتك في ESign ثم ثبّته." \
+            --latest
