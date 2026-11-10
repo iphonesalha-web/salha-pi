@@ -40,9 +40,19 @@ final class Pi: ObservableObject {
         state = .connecting
         var lastError = "تعذّر الوصول"
         for host in d.hosts {
+            // pi.local → عنوان IP عبر Bonjour قبل الاتصال
+            var target = host
+            if host.lowercased().hasSuffix(".local") {
+                if let ip = await LocalResolver.resolve(host, port: d.port) {
+                    target = ip
+                } else {
+                    lastError = "لم يُعثر على \(host) في الشبكة. تأكد من: الإعدادات ← الخصوصية ← الشبكة المحلية ← صالحة Pi مفعّل. أو أضف العنوان الرقمي كعنوان احتياطي."
+                    continue
+                }
+            }
             do {
                 let c = try await SSHClient.connect(
-                    host: host,
+                    host: target,
                     port: d.port,
                     authenticationMethod: .passwordBased(username: d.user, password: password),
                     hostKeyValidator: .acceptAnything(),
@@ -54,7 +64,7 @@ final class Pi: ObservableObject {
                 state = .connected
                 return
             } catch {
-                lastError = Self.describe(error)
+                lastError = Self.describe(error) + "\n(\(target))"
             }
         }
         state = .failed(lastError)
@@ -143,6 +153,6 @@ final class Pi: ObservableObject {
             return "لم يُعثر على العنوان. جرّب العنوان الرقمي (192.168.178.x) في إعدادات الجهاز."
         }
         if let e = error as? CommandError { return e.message }
-        return s
+        return "تعذّر الاتصال: " + s
     }
 }
