@@ -52,18 +52,19 @@ struct Metrics: Equatable {
         func line(_ i: Int) -> String { i < l.count ? l[i].trimmingCharacters(in: .whitespaces) : "" }
         var m = Metrics()
         if let t = Double(line(0)) { m.tempC = t / 1000 }
-        m.cpuPercent = cpu(line(1), line(3))
-        let mem = line(4).split(separator: " ").compactMap { Double($0) }
+        // ملاحظة: `sleep` لا يطبع سطراً، فالقراءة الثانية لـ /proc/stat في السطر 2 مباشرة.
+        m.cpuPercent = cpu(line(1), line(2))
+        let mem = line(3).split(separator: " ").compactMap { Double($0) }
         if mem.count == 2 { m.memTotal = mem[0]; m.memAvailable = mem[1] }
-        let disk = line(5).split(separator: " ").compactMap { Double($0) }
+        let disk = line(4).split(separator: " ").compactMap { Double($0) }
         if disk.count == 2 { m.diskTotal = disk[0]; m.diskUsed = disk[1] }
-        m.uptime = Double(line(6)) ?? 0
-        m.load = line(7).split(separator: " ").compactMap { Double($0) }
-        m.hostname = line(8)
-        m.ip = line(9)
-        m.throttled = line(10)
-        m.model = line(11)
-        m.os = line(12)
+        m.uptime = Double(line(5)) ?? 0
+        m.load = line(6).split(separator: " ").compactMap { Double($0) }
+        m.hostname = line(7)
+        m.ip = line(8)
+        m.throttled = line(9)
+        m.model = line(10)
+        m.os = line(11)
         return m
     }
 
