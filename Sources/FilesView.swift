@@ -31,6 +31,9 @@ struct FilesView: View {
     @State private var deleting: RemoteFile?
     @State private var progress: String?
     @State private var shareURL: URL?
+    @State private var query = ""
+    @State private var found: [RemoteFile] = []
+    @State private var searching = false
 
     var body: some View {
         List {
@@ -38,6 +41,21 @@ struct FilesView: View {
             if let progress {
                 Section { HStack { ProgressView(); Text(progress).font(.subheadline) } }
             }
+            if isSearching {
+                Section {
+                    if searching && found.isEmpty {
+                        HStack { Spacer(); ProgressView(); Spacer() }
+                    } else if found.isEmpty {
+                        Text("لا توجد نتائج").foregroundColor(.secondary)
+                    }
+                    ForEach(found) { f in
+                        resultRow(f)
+                    }
+                } header: {
+                    Text(found.count >= 200 ? "أول 200 نتيجة (الأحدث أولاً)" : "نتائج البحث: \(found.count) (الأحدث أولاً)")
+                        .textCase(nil)
+                }
+            } else {
             Section {
                 if loading && files.isEmpty {
                     HStack { Spacer(); ProgressView(); Spacer() }
@@ -53,7 +71,13 @@ struct FilesView: View {
                     .environment(\.layoutDirection, .leftToRight)
                     .textCase(nil)
             }
+            }
         }
+        .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always),
+                    prompt: "ابحث عن ملف (الاسم أو رقم الفاتورة)")
+        .textInputAutocapitalization(.never)
+        .autocorrectionDisabled()
+        .task(id: query) { await search() }
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(path == nil ? .large : .inline)
         .navigationDestination(for: RemoteFile.self) { FilesView(path: $0.path) }
@@ -97,6 +121,77 @@ struct FilesView: View {
         .errorAlert($error)
     }
 
+    private var isSearching: Bool {
+        !query.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    /// صف نتيجة بحث: الاسم كاملاً + المجلد الذي هو فيه
+    @ViewBuilder
+    private func resultRow(_ f: RemoteFile) -> some View {
+        let parent = ((f.path as NSString).deletingLastPathComponent)
+        let shown = parent.hasPrefix(resolved) ? String(parent.dropFirst(resolved.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/")) : parent
+        let content = HStack(spacing: 12) {
+            Image(systemName: icon(f))
+                .font(.title3)
+                .foregroundColor(f.isDir ? Theme.accent : .secondary)
+                .frame(width: 28)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(f.name).lineLimit(3).truncationMode(.middle)
+                    .environment(\.layoutDirection, .leftToRight)
+                Text(shown.isEmpty ? "." : shown)
+                    .font(.caption2.monospaced())
+                    .foregroundColor(.secondary)
+                    .lineLimit(1).truncationMode(.head)
+                    .environment(\.layoutDirection, .leftToRight)
+                HStack(spacing: 8) {
+                    if !f.isDir { Text(Fmt.bytes(Double(f.size))) }
+                    if let d = f.modified { Text(d, style: .date) }
+                }
+                .font(.caption)
+                .foregroundColor(.secondary)
+            }
+        }
+        if f.isDir {
+            NavigationLink(value: f) { content }
+        } else {
+            Button { download(f) } label: { content }
+                .foregroundColor(.primary)
+        }
+    }
+
+    /// بحث بالاسم داخل هذا المجلد وكل ما تحته (عبر find على الـ Pi). عدة كلمات = كلها لازم تظهر في الاسم.
+    private func search() async {
+        let terms = query.split(whereSeparator: { $0 == " " }).map(String.init).filter { !$0.isEmpty }
+        guard !terms.isEmpty, pi.isConnected, !resolved.isEmpty else {
+            found = []; searching = false; return
+        }
+        searching = true
+        // تأخير بسيط حتى لا نبحث مع كل حرف
+        do { try await Task.sleep(nanoseconds: 450_000_000) } catch { return }
+        let names = terms.map { "-iname " + ("*" + $0 + "*").shellQuoted }.joined(separator: " ")
+        let cmd = "find \(resolved.shellQuoted) \\( -type f -o -type d \\) \(names) -printf '%T@\\t%s\\t%y\\t%p\\n' 2>/dev/null | sort -rn | head -200"
+        do {
+            let r = try await pi.run(cmd)
+            if Task.isCancelled { return }
+            var list: [RemoteFile] = []
+            for line in r.out.split(separator: "\n") {
+                let p = line.split(separator: "\t", maxSplits: 3, omittingEmptySubsequences: false)
+                guard p.count == 4 else { continue }
+                let path = String(p[3])
+                list.append(RemoteFile(
+                    name: (path as NSString).lastPathComponent, path: path,
+                    isDir: p[2] == "d", isLink: p[2] == "l",
+                    size: UInt64(p[1]) ?? 0,
+                    modified: Double(p[0]).map { Date(timeIntervalSince1970: $0) }
+                ))
+            }
+            found = list
+        } catch {
+            if !Task.isCancelled { self.error = Pi.describe(error) }
+        }
+        searching = false
+    }
+
     private var title: String {
         if path == nil { return "الملفات" }
         return (resolved as NSString).lastPathComponent
@@ -115,7 +210,7 @@ struct FilesView: View {
                 .foregroundColor(f.isDir ? Theme.accent : .secondary)
                 .frame(width: 28)
             VStack(alignment: .leading, spacing: 2) {
-                Text(f.name).lineLimit(1)
+                Text(f.name).lineLimit(2).truncationMode(.middle)
                     .environment(\.layoutDirection, .leftToRight)
                 HStack(spacing: 8) {
                     if !f.isDir { Text(Fmt.bytes(Double(f.size))) }
