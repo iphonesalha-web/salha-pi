@@ -15,9 +15,16 @@ struct Metrics: Equatable {
     var throttled: String = ""
     var model = ""
     var os = ""
+    var kernel = ""
+    var rxBytes: Double = 0       // مجموع ما استُقبل عبر الشبكة منذ التشغيل
+    var txBytes: Double = 0
+    var cores = 0
+    var hddTotal: Double = 0      // /mnt/hdd إن كان موصولاً
+    var hddUsed: Double = 0
 
     var memUsedPercent: Double { memTotal > 0 ? (memTotal - memAvailable) / memTotal * 100 : 0 }
     var diskPercent: Double { diskTotal > 0 ? diskUsed / diskTotal * 100 : 0 }
+    var hddPercent: Double { hddTotal > 0 ? hddUsed / hddTotal * 100 : 0 }
 
     /// 0x0 = لا مشاكل. غير ذلك = ضعف كهرباء أو حرارة (حسب vcgencmd).
     var powerWarning: String? {
@@ -45,6 +52,10 @@ struct Metrics: Equatable {
     vcgencmd get_throttled 2>/dev/null || echo throttled=NA
     tr -d '\\0' < /proc/device-tree/model 2>/dev/null; echo
     . /etc/os-release 2>/dev/null && echo "$PRETTY_NAME"
+    uname -r
+    sed 's/:/ /' /proc/net/dev | awk 'NR>2 && $1 !~ /^(lo|veth|docker|br-)/ {rx+=$2; tx+=$10} END {printf "%.0f %.0f\\n", rx, tx}'
+    nproc
+    mountpoint -q /mnt/hdd 2>/dev/null && df -B1 /mnt/hdd | awk 'NR==2{print $2, $3}'; echo
     """
 
     static func parse(_ text: String) -> Metrics {
@@ -65,6 +76,12 @@ struct Metrics: Equatable {
         m.throttled = line(9)
         m.model = line(10)
         m.os = line(11)
+        m.kernel = line(12)
+        let net = line(13).split(separator: " ").compactMap { Double($0) }
+        if net.count == 2 { m.rxBytes = net[0]; m.txBytes = net[1] }
+        m.cores = Int(line(14)) ?? 0
+        let hdd = line(15).split(separator: " ").compactMap { Double($0) }
+        if hdd.count == 2 { m.hddTotal = hdd[0]; m.hddUsed = hdd[1] }
         return m
     }
 
@@ -85,6 +102,12 @@ struct Metrics: Equatable {
 }
 
 enum Fmt {
+    static func rate(_ b: Double) -> String {
+        if b < 1024 { return String(format: "%.0f B/s", b) }
+        if b < 1024 * 1024 { return String(format: "%.1f KiB/s", b / 1024) }
+        return String(format: "%.1f MiB/s", b / 1024 / 1024)
+    }
+
     static func bytes(_ b: Double) -> String {
         ByteCountFormatter.string(fromByteCount: Int64(b), countStyle: .binary)
     }

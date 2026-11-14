@@ -4,12 +4,14 @@ import SwiftUI
 struct SalhaPiApp: App {
     @StateObject private var store = DeviceStore()
     @StateObject private var pi = Pi()
+    @StateObject private var metrics = MetricsModel()
 
     var body: some Scene {
         WindowGroup {
             RootView()
                 .environmentObject(store)
                 .environmentObject(pi)
+                .environmentObject(metrics)
                 .environment(\.layoutDirection, .rightToLeft)
                 .environment(\.locale, Locale(identifier: "ar"))
                 .tint(Theme.accent)
@@ -22,6 +24,13 @@ enum Theme {
     static let good = Color.green
     static let warn = Color.orange
     static let bad = Color.red
+    /// أزرق الأيقونات والقيم الطبيعية
+    static let icon = Color(red: 0.36, green: 0.66, blue: 0.96)
+
+    /// لون القيمة: أزرق طبيعي، برتقالي تحذير، أحمر خطر.
+    static func value(_ v: Double, warn w: Double = 70, bad b: Double = 90) -> Color {
+        v >= b ? bad : (v >= w ? warn : icon)
+    }
 
     static func level(_ percent: Double, warn w: Double = 70, bad b: Double = 90) -> Color {
         percent >= b ? bad : (percent >= w ? warn : good)
@@ -31,6 +40,7 @@ enum Theme {
 struct RootView: View {
     @EnvironmentObject var store: DeviceStore
     @EnvironmentObject var pi: Pi
+    @EnvironmentObject var metrics: MetricsModel
     @Environment(\.scenePhase) private var phase
 
     var body: some View {
@@ -42,7 +52,12 @@ struct RootView: View {
             }
         }
         .task(id: store.selectedID) {
+            metrics.reset()
             if let d = store.selected { await pi.connect(d) }
+        }
+        .task(id: pi.state) {
+            // القراءة الدورية للمقاييس طوال عمل التطبيق (للرئيسية والرسوم البيانية)
+            if pi.state == .connected { await metrics.run(pi) }
         }
         .onChange(of: phase) { _, p in
             // عند الرجوع للتطبيق: إن انقطع الاتصال في الخلفية نعيده.
@@ -55,18 +70,7 @@ struct RootView: View {
 
 struct MainTabs: View {
     var body: some View {
-        TabView {
-            NavigationStack { DashboardView() }
-                .tabItem { Label("الرئيسية", systemImage: "gauge.with.dots.needle.33percent") }
-            NavigationStack { ServicesView() }
-                .tabItem { Label("الخدمات", systemImage: "gearshape.2") }
-            NavigationStack { FilesView(path: nil) }
-                .tabItem { Label("الملفات", systemImage: "folder") }
-            NavigationStack { TerminalScreen() }
-                .tabItem { Label("الطرفية", systemImage: "terminal") }
-            NavigationStack { MoreView() }
-                .tabItem { Label("المزيد", systemImage: "ellipsis.circle") }
-        }
+        NavigationStack { HomeView() }
     }
 }
 

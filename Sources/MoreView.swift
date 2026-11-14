@@ -54,7 +54,7 @@ struct MoreView: View {
                 }
             }
         }
-        .navigationTitle("المزيد")
+        .navigationTitle("الإعدادات")
         .navigationDestination(item: $editing) { DeviceEditView(device: $0, isNew: false) }
     }
 }
