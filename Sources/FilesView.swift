@@ -194,7 +194,7 @@ struct FilesView: View {
 
     private var title: String {
         if path == nil { return "الملفات" }
-        return (resolved as NSString).lastPathComponent
+        return ((path ?? resolved) as NSString).lastPathComponent
     }
 
     private var visible: [RemoteFile] {
@@ -266,11 +266,27 @@ struct FilesView: View {
         do {
             if resolved.isEmpty {
                 if let path {
-                    resolved = path
+                    // رابط رمزي (مثل HDD ← /mnt/hdd): نفتح المسار الحقيقي
+                    let real = (try? await pi.run("readlink -f -- \(path.shellQuoted)"))?.out
+                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    resolved = real.hasPrefix("/") ? real : path
                 } else {
                     resolved = try await pi.runOK("printf %s \"$HOME\"").trimmingCharacters(in: .whitespacesAndNewlines)
                 }
             }
+            let list: [RemoteFile]
+            do { list = try await listViaSFTP() }
+            catch { list = try await listViaSSH() }
+            files = list.sorted {
+                if $0.isDir != $1.isDir { return $0.isDir }
+                return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+            }
+        } catch {
+            self.error = Pi.describe(error)
+        }
+    }
+
+    private func listViaSFTP() async throws -> [RemoteFile] {
             let sftp = try await pi.openSFTP()
             defer { Task { try? await sftp.close() } }
             let names = try await sftp.listDirectory(atPath: resolved)
@@ -293,13 +309,29 @@ struct FilesView: View {
                     ))
                 }
             }
-            files = list.sorted {
-                if $0.isDir != $1.isDir { return $0.isDir }
-                return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
-            }
-        } catch {
-            self.error = Pi.describe(error)
+            return list
+    }
+
+    /// احتياط: قراءة المجلد عبر SSH (find) إن فشل SFTP لأي سبب.
+    private func listViaSSH() async throws -> [RemoteFile] {
+        let cmd = "find \(resolved.shellQuoted) -mindepth 1 -maxdepth 1 -printf '%T@\\t%s\\t%y\\t%Y\\t%f\\n'"
+        let out = try await pi.runOK(cmd)
+        var list: [RemoteFile] = []
+        for line in out.split(separator: "\n") {
+            let p = line.split(separator: "\t", maxSplits: 4, omittingEmptySubsequences: false)
+            guard p.count == 5 else { continue }
+            let kind = String(p[2])
+            let target = String(p[3])
+            let name = String(p[4])
+            list.append(RemoteFile(
+                name: name, path: join(name),
+                isDir: kind == "d" || (kind == "l" && target == "d"),
+                isLink: kind == "l",
+                size: UInt64(p[1]) ?? 0,
+                modified: Double(p[0]).map { Date(timeIntervalSince1970: $0) }
+            ))
         }
+        return list
     }
 
     private func join(_ name: String) -> String {
