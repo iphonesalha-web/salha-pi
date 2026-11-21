@@ -1,5 +1,7 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import QuickLook
+import AVKit
 import Citadel
 import NIOCore
 
@@ -34,12 +36,25 @@ struct FilesView: View {
     @State private var query = ""
     @State private var found: [RemoteFile] = []
     @State private var searching = false
+    @State private var previewURL: URL?
+    @State private var videoURL: URL?
+    @State private var job: Task<Void, Never>?
 
     var body: some View {
         List {
             if path == nil { Section { ConnectionBanner() }.listRowBackground(Color.clear) }
             if let progress {
-                Section { HStack { ProgressView(); Text(progress).font(.subheadline) } }
+                Section {
+                    HStack {
+                        ProgressView()
+                        Text(progress).font(.subheadline)
+                        Spacer()
+                        if job != nil {
+                            Button("إلغاء") { job?.cancel(); job = nil; self.progress = nil }
+                                .font(.subheadline.bold())
+                        }
+                    }
+                }
             }
             if isSearching {
                 Section {
@@ -118,6 +133,10 @@ struct FilesView: View {
         .sheet(item: Binding(get: { shareURL.map { ShareItem(url: $0) } }, set: { shareURL = $0?.url })) { item in
             ShareSheet(url: item.url)
         }
+        .quickLookPreview($previewURL)
+        .fullScreenCover(item: Binding(get: { videoURL.map { ShareItem(url: $0) } }, set: { videoURL = $0?.url })) { item in
+            VideoPlayerScreen(url: item.url)
+        }
         .errorAlert($error)
     }
 
@@ -154,7 +173,7 @@ struct FilesView: View {
         if f.isDir {
             NavigationLink(value: f) { content }
         } else {
-            Button { download(f) } label: { content }
+            Button { open(f) } label: { content }
                 .foregroundColor(.primary)
         }
     }
@@ -224,7 +243,7 @@ struct FilesView: View {
             if f.isDir {
                 NavigationLink(value: f) { content }
             } else {
-                Button { download(f) } label: { content }
+                Button { open(f) } label: { content }
                     .foregroundColor(.primary)
             }
         }
@@ -235,6 +254,9 @@ struct FilesView: View {
         }
         .contextMenu {
             if !f.isDir {
+                if FileKind.of(f.name) != .other {
+                    Button { open(f) } label: { Label("عرض", systemImage: "eye") }
+                }
                 Button { download(f) } label: { Label("تنزيل ومشاركة", systemImage: "square.and.arrow.down") }
             }
             Button { newName = f.name; renaming = f } label: { Label("إعادة تسمية", systemImage: "pencil") }
@@ -338,36 +360,89 @@ struct FilesView: View {
         resolved == "/" ? "/" + name : resolved + "/" + name
     }
 
-    private func download(_ f: RemoteFile) {
-        Task {
-            progress = "تنزيل \(f.name)…"
-            defer { progress = nil }
-            do {
-                let sftp = try await pi.openSFTP()
-                defer { Task { try? await sftp.close() } }
-                let file = try await sftp.openFile(filePath: f.path, flags: .read)
-                var data = Data()
-                var offset: UInt64 = 0
-                let chunk: UInt32 = 256 * 1024
-                while true {
-                    let buf = try await file.read(from: offset, length: chunk)
-                    if buf.readableBytes == 0 { break }
-                    data.append(contentsOf: buf.readableBytesView)
-                    offset += UInt64(buf.readableBytes)
-                    if f.size > 0 {
-                        progress = "تنزيل \(f.name)… \(Int(Double(offset) / Double(f.size) * 100))%"
-                    }
-                    if f.size > 0 && offset >= f.size { break }
-                }
-                try await file.close()
-                let url = FileManager.default.temporaryDirectory.appendingPathComponent(f.name)
-                try? FileManager.default.removeItem(at: url)
-                try data.write(to: url)
-                shareURL = url
-            } catch {
-                self.error = Pi.describe(error)
-            }
+    /// ضغطة على ملف: صور/PDF/نصوص → عارض الآيفون، فيديو/صوت → مشغّل، والباقي → مشاركة.
+    private func open(_ f: RemoteFile) {
+        let kind = FileKind.of(f.name)
+        // صيغ لا يشغّلها الآيفون (mkv/webm…) → مشاركة، ومنها يمكن فتحها في VLC
+        if kind == .other || kind == .unsupportedVideo {
+            return download(f)
         }
+        if kind != .media && f.size > 300 * 1024 * 1024 {
+            return download(f)
+        }
+        job?.cancel()
+        job = Task {
+            do {
+                let url = try await fetch(f)
+                if Task.isCancelled { return }
+                if kind == .media { videoURL = url } else { previewURL = url }
+            } catch {
+                if !Task.isCancelled { self.error = Pi.describe(error) }
+            }
+            job = nil
+        }
+    }
+
+    private func download(_ f: RemoteFile) {
+        job?.cancel()
+        job = Task {
+            do {
+                let url = try await fetch(f)
+                if !Task.isCancelled { shareURL = url }
+            } catch {
+                if !Task.isCancelled { self.error = Pi.describe(error) }
+            }
+            job = nil
+        }
+    }
+
+    /// ينزّل الملف إلى ذاكرة مؤقتة على الآيفون (يُكتب للقرص مباشرة، لا للذاكرة)،
+    /// ويعيد استعمال النسخة المنزّلة إن كانت نفس الحجم والتاريخ.
+    private func fetch(_ f: RemoteFile) async throws -> URL {
+        let dir = PreviewCache.dir(for: f)
+        let url = dir.appendingPathComponent(f.name)
+        if let a = try? FileManager.default.attributesOfItem(atPath: url.path),
+           (a[.size] as? NSNumber)?.uint64Value == f.size, f.size > 0 {
+            return url
+        }
+        PreviewCache.trim(keeping: f.size)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let part = url.appendingPathExtension("part")
+        try? FileManager.default.removeItem(at: part)
+        FileManager.default.createFile(atPath: part.path, contents: nil)
+        let out = try FileHandle(forWritingTo: part)
+        defer { progress = nil }
+        progress = "فتح \(f.name)…"
+        do {
+            let sftp = try await pi.openSFTP()
+            defer { Task { try? await sftp.close() } }
+            let file = try await sftp.openFile(filePath: f.path, flags: .read)
+            var offset: UInt64 = 0
+            let chunk: UInt32 = 1024 * 1024
+            let started = Date()
+            while true {
+                try Task.checkCancellation()
+                let buf = try await file.read(from: offset, length: chunk)
+                if buf.readableBytes == 0 { break }
+                try out.write(contentsOf: Data(buf.readableBytesView))
+                offset += UInt64(buf.readableBytes)
+                if f.size > 0 {
+                    let pct = Int(Double(offset) / Double(f.size) * 100)
+                    let speed = Double(offset) / max(Date().timeIntervalSince(started), 0.1)
+                    progress = "\(f.name) — \(pct)% · \(Fmt.bytes(speed))/ث"
+                }
+                if f.size > 0 && offset >= f.size { break }
+            }
+            try? await file.close()
+            try out.close()
+        } catch {
+            try? out.close()
+            try? FileManager.default.removeItem(at: part)
+            throw error
+        }
+        try? FileManager.default.removeItem(at: url)
+        try FileManager.default.moveItem(at: part, to: url)
+        return url
     }
 
     private func upload(_ urls: [URL]) {
@@ -456,4 +531,84 @@ struct ShareSheet: UIViewControllerRepresentable {
         UIActivityViewController(activityItems: [url], applicationActivities: nil)
     }
     func updateUIViewController(_ vc: UIActivityViewController, context: Context) {}
+}
+
+enum FileKind {
+    case media, unsupportedVideo, quickLook, other
+
+    static func of(_ name: String) -> FileKind {
+        switch (name as NSString).pathExtension.lowercased() {
+        case "mp4", "mov", "m4v", "mp3", "m4a", "aac", "wav", "caf": return .media
+        case "mkv", "webm", "avi", "flv", "wmv", "ts", "opus", "ogg", "flac": return .unsupportedVideo
+        case "pdf", "jpg", "jpeg", "png", "heic", "heif", "gif", "webp", "bmp", "tif", "tiff",
+             "txt", "log", "md", "json", "csv", "conf", "yml", "yaml", "sh", "py", "html", "xml",
+             "doc", "docx", "xls", "xlsx", "ppt", "pptx", "pages", "numbers", "key", "rtf", "usdz":
+            return .quickLook
+        default: return .other
+        }
+    }
+}
+
+/// ذاكرة مؤقتة للملفات المفتوحة — لا تتجاوز 2GB تقريباً.
+enum PreviewCache {
+    static var root: URL {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("preview")
+    }
+
+    /// مجلد خاص لكل ملف (حسب مساره) حتى لا يتصادم ملفان بنفس الاسم.
+    static func dir(for f: RemoteFile) -> URL {
+        var h: UInt64 = 1469598103934665603
+        for b in f.path.utf8 { h = (h ^ UInt64(b)) &* 1099511628211 }
+        return root.appendingPathComponent(String(h, radix: 36))
+    }
+
+    static func trim(keeping incoming: UInt64, limit: UInt64 = 2 * 1024 * 1024 * 1024) {
+        let fm = FileManager.default
+        guard let items = fm.enumerator(at: root, includingPropertiesForKeys: [.fileSizeKey, .contentAccessDateKey]) else { return }
+        var files: [(URL, UInt64, Date)] = []
+        for case let u as URL in items {
+            let v = try? u.resourceValues(forKeys: [.fileSizeKey, .contentAccessDateKey, .isRegularFileKey])
+            guard v?.isRegularFile == true else { continue }
+            files.append((u, UInt64(v?.fileSize ?? 0), v?.contentAccessDate ?? .distantPast))
+        }
+        var total = files.reduce(0) { $0 + $1.1 } + incoming
+        for (u, size, _) in files.sorted(by: { $0.2 < $1.2 }) where total > limit {
+            try? fm.removeItem(at: u.deletingLastPathComponent())
+            total -= size
+        }
+    }
+}
+
+/// مشغّل فيديو/صوت بملء الشاشة (تقديم/تأخير، سرعة، صورة داخل صورة، AirPlay).
+struct VideoPlayerScreen: View {
+    let url: URL
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            Color.black.ignoresSafeArea()
+            PlayerController(url: url).ignoresSafeArea()
+            Button { dismiss() } label: {
+                Image(systemName: "xmark.circle.fill").font(.largeTitle)
+                    .symbolRenderingMode(.palette).foregroundStyle(.white, .black.opacity(0.5))
+            }
+            .padding(.top, 50).padding(.leading, 16)
+        }
+    }
+}
+
+struct PlayerController: UIViewControllerRepresentable {
+    let url: URL
+    func makeUIViewController(context: Context) -> AVPlayerViewController {
+        try? AVAudioSession.sharedInstance().setCategory(.playback)
+        let vc = AVPlayerViewController()
+        vc.player = AVPlayer(url: url)
+        vc.allowsPictureInPicturePlayback = true
+        vc.player?.play()
+        return vc
+    }
+    func updateUIViewController(_ vc: AVPlayerViewController, context: Context) {}
+    static func dismantleUIViewController(_ vc: AVPlayerViewController, coordinator: ()) {
+        vc.player?.pause()
+    }
 }
